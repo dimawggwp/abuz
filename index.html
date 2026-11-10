@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>Quiz Cam</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Quiz Cam">
+<meta name="theme-color" content="#0b0d12">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-180.png">
+<style>
+  :root { --bg:#0b0d12; --fg:#f2f4f8; --acc:#3ddc84; --err:#ff5c5c; --mut:#9aa3b2; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; overflow:hidden; }
+  #v { position:fixed; inset:0; width:100%; height:100%; object-fit:cover; background:#000; }
+  #frame { position:fixed; left:5%; right:5%; top:14%; height:46%;
+    border:2px solid rgba(255,255,255,.55); border-radius:16px; pointer-events:none;
+    box-shadow:0 0 0 100vmax rgba(0,0,0,.35); transition:border-color .2s; }
+  #frame.busy { border-color:var(--acc); }
+  #top { position:fixed; top:calc(env(safe-area-inset-top) + 8px); left:12px; right:12px;
+    display:flex; justify-content:space-between; align-items:center; gap:8px; z-index:5; }
+  .pill { background:rgba(0,0,0,.55); border:1px solid rgba(255,255,255,.15); color:var(--fg);
+    border-radius:999px; padding:8px 14px; font-size:14px; }
+  button.pill { cursor:pointer; }
+  #mode.acc { color:var(--acc); border-color:var(--acc); }
+  #ans { position:fixed; left:12px; right:12px; bottom:calc(env(safe-area-inset-bottom) + 120px);
+    background:rgba(0,0,0,.78); border-radius:18px; padding:16px 18px; z-index:5;
+    font-size:30px; font-weight:700; line-height:1.2; text-align:center; display:none;
+    word-wrap:break-word; max-height:34vh; overflow:auto; }
+  #ans.show { display:block; }
+  #ans .note { display:block; font-size:15px; font-weight:400; color:var(--mut); margin-top:6px; }
+  #ans .t { display:block; font-size:12px; font-weight:400; color:var(--mut); margin-top:6px; }
+  #ans.err { color:var(--err); font-size:17px; font-weight:500; }
+  #shoot { position:fixed; left:50%; bottom:calc(env(safe-area-inset-bottom) + 24px);
+    transform:translateX(-50%); width:82px; height:82px; border-radius:50%; z-index:5;
+    border:5px solid #fff; background:rgba(255,255,255,.25); }
+  #shoot:active { transform:translateX(-50%) scale(.92); }
+  #shoot.busy { border-color:var(--acc); animation:p .7s infinite alternate; }
+  @keyframes p { to { background:rgba(61,220,132,.5); } }
+  #setup { position:fixed; inset:0; background:var(--bg); z-index:10; display:none;
+    flex-direction:column; justify-content:center; padding:24px; gap:14px; }
+  #setup.show { display:flex; }
+  #setup h1 { margin:0; font-size:24px; }
+  #setup p { margin:0; color:var(--mut); font-size:15px; line-height:1.4; }
+  #setup input { font-size:16px; padding:14px; border-radius:12px; border:1px solid #333a48;
+    background:#141824; color:var(--fg); width:100%; }
+  #setup button { font-size:17px; padding:14px; border-radius:12px; border:0;
+    background:var(--acc); color:#04160b; font-weight:700; }
+  #hint { position:fixed; top:62%; left:0; right:0; text-align:center; color:rgba(255,255,255,.8);
+    font-size:14px; pointer-events:none; text-shadow:0 1px 3px #000; }
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<div id="frame"></div>
+<div id="hint">Вопрос или картину — в рамку, нажми кнопку или на экран</div>
+<div id="top">
+  <button class="pill" id="mode">⚡ Быстро</button>
+  <button class="pill" id="keyBtn">🔑</button>
+</div>
+<div id="ans"></div>
+<button id="shoot" aria-label="Ответить"></button>
+
+<div id="setup">
+  <h1>Quiz Cam</h1>
+  <p>Вставь ключи. Они хранятся только на этом устройстве и не попадают в GitHub. Можно один, лучше оба: вопрос уходит в оба сервиса сразу, показывается самый быстрый ответ.</p>
+  <input id="keyIn" type="password" placeholder="Groq: gsk_..." autocomplete="off" autocapitalize="off" spellcheck="false">
+  <input id="gemIn" type="password" placeholder="Gemini: AIza... / AQ...." autocomplete="off" autocapitalize="off" spellcheck="false">
+  <button id="save">Сохранить</button>
+</div>
+
+<script>
+const MODEL = 'qwen/qwen3.8-27b';
+const SYS = `You read a phone-camera photo and give the correct answer instantly.
+- If it shows a question with answer options (A/B/C/D, 1-4, or a list): output the correct option exactly as "B) option text". Read the options carefully and choose the single most correct one.
+- If it is a painting / artwork / famous image: output "Title — Artist, year".
+- If it is a question without options or a math problem: output only the final answer.
+Line 1: the answer only. Optional line 2: a short justification, max 8 words, in the language of the question. No other text.`;
+
+const $ = id => document.getElementById(id);
+const v = $('v'), ans = $('ans'), shoot = $('shoot'), frame = $('frame');
+const ls = {
+  get(k){ try { return localStorage.getItem(k); } catch { return null; } },
+  set(k,x){ try { localStorage.setItem(k,x); } catch {} }
+};
+let key = ls.get('groqKey') || '';
+let gemKey = ls.get('gemKey') || '';
+let accurate = ls.get('mode') === 'acc';
+let busy = false;
+let groqBlockedUntil = 0; // after a 429 skip Groq until its limit resets
+const hasKey = () => !!(key || gemKey);
+
+function renderMode(){
+  $('mode').textContent = accurate ? '🎯 Точно' : '⚡ Быстро';
+  $('mode').classList.toggle('acc', accurate);
+}
+renderMode();
+$('mode').onclick = e => { e.stopPropagation(); accurate = !accurate; ls.set('mode', accurate?'acc':'fast'); renderMode(); };
+$('keyBtn').onclick = e => { e.stopPropagation(); $('keyIn').value = key; $('gemIn').value = gemKey; $('setup').classList.add('show'); };
+$('save').onclick = () => {
+  key = $('keyIn').value.trim();
+  gemKey = $('gemIn').value.trim();
+  if (!hasKey()) return;
+  ls.set('groqKey', key); ls.set('gemKey', gemKey);
+  $('setup').classList.remove('show');
+  startCam();
+};
+if (!hasKey()) $('setup').classList.add('show');
+
+async function startCam(){
+  if (v.srcObject) return;
+  try {
+    v.srcObject = await navigator.mediaDevices.getUserMedia({
+      video:{ facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080} }, audio:false });
+  } catch (e) { show('Нет доступа к камере: ' + e.message, true); }
+}
+if (hasKey()) startCam();
+
+function show(html, err){
+  ans.className = 'show' + (err ? ' err' : '');
+  ans.innerHTML = html;
+}
+const esc = s => s.replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+// Crop the framed area from the video and shrink it (fewer tokens = faster + more requests/min)
+function grab(){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw) return null;
+  const sw = innerWidth, sh = innerHeight;
+  const s = Math.max(sw / vw, sh / vh);             // object-fit: cover scale
+  const ox = (vw * s - sw) / 2, oy = (vh * s - sh) / 2;
+  const r = frame.getBoundingClientRect();
+  const pad = 12;
+  let x = (r.left - pad + ox) / s, y = (r.top - pad + oy) / s;
+  let w = (r.width + pad*2) / s, h = (r.height + pad*2) / s;
+  x = Math.max(0,x); y = Math.max(0,y); w = Math.min(vw - x, w); h = Math.min(vh - y, h);
+  const MAX = accurate ? 1024 : 768;
+  const k = Math.min(1, MAX / Math.max(w, h));
+  const c = document.createElement('canvas');
+  c.width = Math.round(w * k); c.height = Math.round(h * k);
+  c.getContext('2d').drawImage(v, x, y, w, h, 0, 0, c.width, c.height);
+  return c.toDataURL('image/jpeg', 0.8);
+}
+
+function fail(name, msg){ const e = new Error(msg); e.src = name; return e; }
+
+async function askGroq(img, signal){
+  if (!key) throw fail('Groq', 'нет ключа');
+  if (Date.now() < groqBlockedUntil) throw fail('Groq', 'лимит');
+  const body = {
+    model: MODEL, temperature: 0,
+    messages: [
+      { role:'system', content: SYS },
+      { role:'user', content: [ { type:'image_url', image_url:{ url: img } }, { type:'text', text:'Answer.' } ] }
+    ]
+  };
+  if (accurate) { body.max_tokens = 900; body.reasoning_effort = 'low'; body.reasoning_format = 'hidden'; }
+  else { body.max_tokens = 80; body.reasoning_effort = 'none'; }
+  const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method:'POST', signal,
+    headers:{ 'Authorization':'Bearer ' + key, 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const m = j?.error?.message || ('HTTP ' + r.status);
+    if (r.status === 429) {
+      const w = m.match(/try again in ([\d.]+)s/);
+      groqBlockedUntil = Date.now() + (w ? +w[1] * 1000 : 10000);
+      throw fail('Groq', 'лимит, ' + (w ? Math.ceil(+w[1]) + ' сек' : 'подожди'));
+    }
+    throw fail('Groq', r.status === 401 ? 'неверный ключ' : m);
+  }
+  return (j.choices?.[0]?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g,'').trim();
+}
+
+async function askGemini(img, signal){
+  if (!gemKey) throw fail('Gemini', 'нет ключа');
+  const model = accurate ? 'gemini-3.5-flash' : 'gemini-flash-lite-latest';
+  const body = {
+    systemInstruction: { parts:[{ text: SYS }] },
+    contents: [{ role:'user', parts:[
+      { inlineData:{ mimeType:'image/jpeg', data: img.split(',')[1] } },
+      { text:'Answer.' } ] }],
+    generationConfig: { temperature:0, maxOutputTokens:120, thinkingConfig:{ thinkingLevel:'minimal' } }
+  };
+  const r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
+    method:'POST', signal,
+    headers:{ 'x-goog-api-key': gemKey, 'Content-Type':'application/json' },
+    body: JSON.stringify(body)
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    const m = j?.error?.message || ('HTTP ' + r.status);
+    throw fail('Gemini', r.status === 429 ? 'лимит' : (r.status === 400 || r.status === 403) && /key/i.test(m) ? 'неверный ключ' : m);
+  }
+  return (j.candidates?.[0]?.content?.parts || []).map(p => p.thought ? '' : (p.text || '')).join('').trim();
+}
+
+async function go(){
+  if (busy) return;
+  if (!hasKey()) { $('setup').classList.add('show'); return; }
+  const img = grab();
+  if (!img) { show('Камера ещё не готова', true); return; }
+  busy = true; shoot.classList.add('busy'); frame.classList.add('busy');
+  if (navigator.vibrate) navigator.vibrate(15);
+  const t0 = performance.now();
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  // Race both providers; first non-empty answer wins, the other is cancelled.
+  const wrap = (name, p) => p.then(t => { if (!t) throw fail(name, 'пустой ответ'); return { name, t }; });
+  try {
+    const { name, t } = await Promise.any([
+      wrap('Groq', askGroq(img, ctrl.signal)),
+      wrap('Gemini', askGemini(img, ctrl.signal))
+    ]);
+    ctrl.abort();
+    const [first, ...rest] = t.split('\n').filter(Boolean);
+    const sec = ((performance.now() - t0) / 1000).toFixed(1);
+    show(esc(first || '—') +
+      (rest.length ? '<span class="note">' + esc(rest.join(' ')) + '</span>' : '') +
+      '<span class="t">' + sec + ' с · ' + name + '</span>');
+  } catch (e) {
+    const errs = (e.errors || [e]).map(x =>
+      x.name === 'AbortError' ? 'таймаут' : (x.src ? x.src + ': ' : '') + x.message);
+    show(esc(errs.filter(s => !/нет ключа$/.test(s)).join(' · ') || 'Ошибка'), true);
+  } finally {
+    clearTimeout(timer);
+    busy = false; shoot.classList.remove('busy'); frame.classList.remove('busy');
+  }
+}
+
+shoot.onclick = e => { e.stopPropagation(); go(); };
+v.onclick = go;
+ans.onclick = () => ans.classList.remove('show');
+document.addEventListener('visibilitychange', () => { if (!document.hidden && hasKey()) startCam(); });
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
+</script>
+</body>
+</html>
